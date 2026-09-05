@@ -1,4 +1,5 @@
 import sys
+import mmap
 
 from dataclasses import dataclass
 
@@ -119,9 +120,83 @@ def read_table_rows(data, page_start, page_size):
 def get_table_schema(data, table_name, page_size):
     """Look up a table's (rootpage, create_sql) from sqlite_schema."""
     for _, values in read_table_rows(data, 0, page_size):
-        if values[2] == table_name:
+        if values[0] == "table" and values[2] == table_name:
             return values[3], values[4]
     return None, None
+
+
+def get_index_root_page(data, table_name, column_name, page_size):
+    """Return the rootpage of an index on table_name's leading column column_name, if any."""
+    for _, values in read_table_rows(data, 0, page_size):
+        if values[0] != "index" or values[2] != table_name:
+            continue
+        index_sql = values[4]
+        inner = index_sql[index_sql.index("(") + 1:index_sql.rindex(")")]
+        indexed_columns = [c.strip().strip('"[]`') for c in inner.split(",")]
+        if indexed_columns and indexed_columns[0] == column_name:
+            return values[3]
+    return None
+
+
+def find_row_by_rowid(data, page_start, page_size, target_rowid):
+    """Point-lookup a single row's column values by rowid, traversing the table b-tree."""
+    page_type, num_cells, cell_pointer_array_start, right_most_pointer = read_page_header(data, page_start)
+
+    if page_type == 0x0d:  # leaf page
+        for i in range(num_cells):
+            pointer_offset = cell_pointer_array_start + i * 2
+            cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
+            _, cursor = read_varint(data, cell_start)  # record size
+            rowid, cursor = read_varint(data, cursor)
+            if rowid == target_rowid:
+                return read_record_values(data, cursor)
+        return None
+
+    for i in range(num_cells):  # interior page: binary-search-like descent by rowid
+        pointer_offset = cell_pointer_array_start + i * 2
+        cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
+        child_page_number = int.from_bytes(data[cell_start:cell_start + 4], byteorder="big")
+        key, _ = read_varint(data, cell_start + 4)
+        if target_rowid <= key:
+            return find_row_by_rowid(data, (child_page_number - 1) * page_size, page_size, target_rowid)
+    return find_row_by_rowid(data, (right_most_pointer - 1) * page_size, page_size, target_rowid)
+
+
+def read_index_cell(data, cell_start, is_interior):
+    """Parse an index b-tree cell, returning (left_child_page, record_values)."""
+    cursor = cell_start
+    left_child_page = None
+    if is_interior:
+        left_child_page = int.from_bytes(data[cursor:cursor + 4], byteorder="big")
+        cursor += 4
+    _, cursor = read_varint(data, cursor)  # payload size
+    return left_child_page, read_record_values(data, cursor)
+
+
+def search_index(data, page_start, page_size, target_value):
+    """Traverse an index b-tree, returning the rowids whose indexed column equals target_value."""
+    page_type, num_cells, cell_pointer_array_start, right_most_pointer = read_page_header(data, page_start)
+    is_interior = page_type == 0x02
+    matches = []
+
+    for i in range(num_cells):
+        pointer_offset = cell_pointer_array_start + i * 2
+        cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
+        left_child_page, values = read_index_cell(data, cell_start, is_interior)
+        key = values[0]
+
+        if is_interior and target_value <= key:
+            matches.extend(search_index(data, (left_child_page - 1) * page_size, page_size, target_value))
+
+        if key == target_value:
+            matches.append(values[-1])
+        elif key > target_value:
+            return matches  # ascending order: no more matches beyond this point
+
+    if is_interior:
+        matches.extend(search_index(data, (right_most_pointer - 1) * page_size, page_size, target_value))
+
+    return matches
 
 
 def parse_column_names(create_sql):
@@ -193,11 +268,8 @@ elif command.upper().startswith("SELECT"):
     table_name = parts[from_index + 1]
 
     with open(database_file_path, "rb") as database_file:
-        database_file.seek(16)
-        page_size = int.from_bytes(database_file.read(2), byteorder="big")
-
-        database_file.seek(0)
-        file_contents = database_file.read()
+        file_contents = mmap.mmap(database_file.fileno(), 0, prot=mmap.PROT_READ)
+        page_size = int.from_bytes(file_contents[16:18], byteorder="big")
 
         root_page, create_sql = get_table_schema(file_contents, table_name, page_size)
         page_start = (root_page - 1) * page_size
@@ -211,16 +283,34 @@ elif command.upper().startswith("SELECT"):
             selected_columns = [c.strip() for c in select_clause.split(",")]
             selected_indexes = [column_names.index(c) for c in selected_columns]
 
-            rows = read_table_rows(file_contents, page_start, page_size)
-            if int_pk_index is not None:  # INTEGER PRIMARY KEY column aliases the rowid
-                rows = [
-                    (rowid, [rowid if i == int_pk_index else v for i, v in enumerate(values)])
-                    for rowid, values in rows
-                ]
+            index_root_page = None
             if where_clause is not None:
                 where_column, where_value = parse_where_clause(where_clause)
-                where_column_index = column_names.index(where_column)
-                rows = [(rowid, values) for rowid, values in rows if str(values[where_column_index]) == where_value]
+                index_root_page = get_index_root_page(file_contents, table_name, where_column, page_size)
+
+            if index_root_page is not None:
+                # Use the index for an O(log n) lookup instead of a full table scan.
+                index_page_start = (index_root_page - 1) * page_size
+                rowids = search_index(file_contents, index_page_start, page_size, where_value)
+                rows = []
+                for rowid in rowids:
+                    values = find_row_by_rowid(file_contents, page_start, page_size, rowid)
+                    if int_pk_index is not None and values[int_pk_index] is None:
+                        values[int_pk_index] = rowid
+                    rows.append((rowid, values))
+            else:
+                rows = read_table_rows(file_contents, page_start, page_size)
+                if int_pk_index is not None:  # INTEGER PRIMARY KEY column aliases the rowid
+                    rows = [
+                        (rowid, [rowid if i == int_pk_index else v for i, v in enumerate(values)])
+                        for rowid, values in rows
+                    ]
+                if where_clause is not None:
+                    where_column_index = column_names.index(where_column)
+                    rows = [
+                        (rowid, values) for rowid, values in rows
+                        if str(values[where_column_index]) == where_value
+                    ]
 
             for _, values in rows:
                 print("|".join(str(values[i]) for i in selected_indexes))
