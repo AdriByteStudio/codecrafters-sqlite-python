@@ -185,6 +185,9 @@ def search_index(data, page_start, page_size, target_value):
         left_child_page, values = read_index_cell(data, cell_start, is_interior)
         key = values[0]
 
+        if key is None:  # NULL sorts before everything and never equals target_value
+            continue
+
         if is_interior and target_value <= key:
             matches.extend(search_index(data, (left_child_page - 1) * page_size, page_size, target_value))
 
