@@ -123,6 +123,12 @@ def parse_column_names(create_sql):
     return column_names
 
 
+def parse_where_clause(where_clause):
+    """Parse a simple 'column = value' condition, returning (column, value)."""
+    column, value = where_clause.split("=", 1)
+    return column.strip(), value.strip().strip("'\"")
+
+
 if command == ".dbinfo":
     with open(database_file_path, "rb") as database_file:
         # You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -150,7 +156,15 @@ elif command == ".tables":
 
         print(" ".join(table_names))
 elif command.upper().startswith("SELECT"):
-    parts = command.split()
+    where_pos = command.upper().find(" WHERE ")
+    if where_pos != -1:
+        main_clause = command[:where_pos]
+        where_clause = command[where_pos + len(" WHERE "):]
+    else:
+        main_clause = command
+        where_clause = None
+
+    parts = main_clause.split()
     from_index = next(i for i, part in enumerate(parts) if part.upper() == "FROM")
     select_clause = " ".join(parts[1:from_index])
     table_name = parts[from_index + 1]
@@ -173,7 +187,13 @@ elif command.upper().startswith("SELECT"):
             selected_columns = [c.strip() for c in select_clause.split(",")]
             selected_indexes = [column_names.index(c) for c in selected_columns]
 
-            for row in read_table_leaf_rows(file_contents, page_start):
+            rows = read_table_leaf_rows(file_contents, page_start)
+            if where_clause is not None:
+                where_column, where_value = parse_where_clause(where_clause)
+                where_column_index = column_names.index(where_column)
+                rows = [row for row in rows if str(row[where_column_index]) == where_value]
+
+            for row in rows:
                 print("|".join(str(row[i]) for i in selected_indexes))
 else:
     print(f"Invalid command: {command}")
