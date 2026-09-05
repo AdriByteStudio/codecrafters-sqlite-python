@@ -76,6 +76,34 @@ def read_record_values(data, record_start):
     return values
 
 
+def read_page_header(data, page_start):
+    """Return (num_cells, cell_pointer_array_start) for a b-tree page.
+
+    Page 1 has a 100-byte file header before its page header.
+    """
+    header_offset = page_start + 100 if page_start == 0 else page_start
+    page_type = data[header_offset]
+    header_size = 12 if page_type in (0x02, 0x05) else 8  # interior pages have a 12-byte header
+    num_cells = int.from_bytes(data[header_offset + 3:header_offset + 5], byteorder="big")
+    return num_cells, header_offset + header_size
+
+
+def read_table_leaf_rows(data, page_start):
+    """Parse a table b-tree leaf page, returning the list of each row's column values."""
+    num_cells, cell_pointer_array_start = read_page_header(data, page_start)
+
+    rows = []
+    for i in range(num_cells):
+        pointer_offset = cell_pointer_array_start + i * 2
+        cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
+
+        _, cursor = read_varint(data, cell_start)  # record size
+        _, cursor = read_varint(data, cursor)  # rowid
+        rows.append(read_record_values(data, cursor))
+
+    return rows
+
+
 if command == ".dbinfo":
     with open(database_file_path, "rb") as database_file:
         # You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -93,26 +121,32 @@ if command == ".dbinfo":
         print(f"number of tables: {number_of_tables}")
 elif command == ".tables":
     with open(database_file_path, "rb") as database_file:
-        database_file.seek(0)
         page = database_file.read()
 
-        number_of_cells = int.from_bytes(page[103:105], byteorder="big")
-
-        # Cell pointer array starts right after the 8-byte leaf page header (which
-        # follows the 100-byte file header).
-        cell_pointer_array_start = 108
         table_names = []
-        for i in range(number_of_cells):
-            pointer_offset = cell_pointer_array_start + i * 2
-            cell_start = int.from_bytes(page[pointer_offset:pointer_offset + 2], byteorder="big")
-
-            _, cursor = read_varint(page, cell_start)  # record size
-            _, cursor = read_varint(page, cursor)  # rowid
-            values = read_record_values(page, cursor)
+        for values in read_table_leaf_rows(page, 0):
             tbl_name = values[2]
             if not tbl_name.startswith("sqlite_"):  # hide internal bookkeeping tables
                 table_names.append(tbl_name)
 
         print(" ".join(table_names))
+elif command.upper().startswith("SELECT COUNT(*)"):
+    table_name = command.split(" ")[-1]
+    with open(database_file_path, "rb") as database_file:
+        database_file.seek(16)
+        page_size = int.from_bytes(database_file.read(2), byteorder="big")
+
+        database_file.seek(0)
+        file_contents = database_file.read()
+
+        root_page = None
+        for values in read_table_leaf_rows(file_contents, 0):
+            if values[2] == table_name:
+                root_page = values[3]
+                break
+
+        page_start = (root_page - 1) * page_size
+        num_cells, _ = read_page_header(file_contents, page_start)
+        print(num_cells)
 else:
     print(f"Invalid command: {command}")
