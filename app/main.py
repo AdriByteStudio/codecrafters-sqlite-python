@@ -76,36 +76,49 @@ def read_record_values(data, record_start):
 
 
 def read_page_header(data, page_start):
-    """Return (num_cells, cell_pointer_array_start) for a b-tree page.
+    """Return (page_type, num_cells, cell_pointer_array_start, right_most_pointer) for a b-tree page.
 
-    Page 1 has a 100-byte file header before its page header.
+    Page 1 has a 100-byte file header before its page header. right_most_pointer is
+    only present (non-None) for interior pages.
     """
     header_offset = page_start + 100 if page_start == 0 else page_start
     page_type = data[header_offset]
-    header_size = 12 if page_type in (0x02, 0x05) else 8  # interior pages have a 12-byte header
+    is_interior = page_type in (0x02, 0x05)
+    header_size = 12 if is_interior else 8
     num_cells = int.from_bytes(data[header_offset + 3:header_offset + 5], byteorder="big")
-    return num_cells, header_offset + header_size
+    right_most_pointer = None
+    if is_interior:
+        right_most_pointer = int.from_bytes(data[header_offset + 8:header_offset + 12], byteorder="big")
+    return page_type, num_cells, header_offset + header_size, right_most_pointer
 
 
-def read_table_leaf_rows(data, page_start):
-    """Parse a table b-tree leaf page, returning the list of each row's column values."""
-    num_cells, cell_pointer_array_start = read_page_header(data, page_start)
+def read_table_rows(data, page_start, page_size):
+    """Parse a table b-tree page (leaf or interior), returning (rowid, values) per row."""
+    page_type, num_cells, cell_pointer_array_start, right_most_pointer = read_page_header(data, page_start)
 
     rows = []
-    for i in range(num_cells):
-        pointer_offset = cell_pointer_array_start + i * 2
-        cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
+    if page_type == 0x0d:  # leaf page: cells hold the actual records
+        for i in range(num_cells):
+            pointer_offset = cell_pointer_array_start + i * 2
+            cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
 
-        _, cursor = read_varint(data, cell_start)  # record size
-        _, cursor = read_varint(data, cursor)  # rowid
-        rows.append(read_record_values(data, cursor))
+            _, cursor = read_varint(data, cell_start)  # record size
+            rowid, cursor = read_varint(data, cursor)
+            rows.append((rowid, read_record_values(data, cursor)))
+    else:  # interior page: cells hold child page numbers to recurse into
+        for i in range(num_cells):
+            pointer_offset = cell_pointer_array_start + i * 2
+            cell_start = page_start + int.from_bytes(data[pointer_offset:pointer_offset + 2], byteorder="big")
+            child_page_number = int.from_bytes(data[cell_start:cell_start + 4], byteorder="big")
+            rows.extend(read_table_rows(data, (child_page_number - 1) * page_size, page_size))
+        rows.extend(read_table_rows(data, (right_most_pointer - 1) * page_size, page_size))
 
     return rows
 
 
-def get_table_schema(data, table_name):
+def get_table_schema(data, table_name, page_size):
     """Look up a table's (rootpage, create_sql) from sqlite_schema."""
-    for values in read_table_leaf_rows(data, 0):
+    for _, values in read_table_rows(data, 0, page_size):
         if values[2] == table_name:
             return values[3], values[4]
     return None, None
@@ -121,6 +134,15 @@ def parse_column_names(create_sql):
             continue
         column_names.append(part.split()[0].strip('"[]`'))
     return column_names
+
+
+def find_integer_primary_key_index(create_sql, column_names):
+    """Return the index of the INTEGER PRIMARY KEY column, or None (it aliases rowid)."""
+    inner = create_sql[create_sql.index("(") + 1:create_sql.rindex(")")]
+    for index, part in enumerate(inner.split(",")):
+        if "integer" in part.lower() and "primary key" in part.lower():
+            return index
+    return None
 
 
 def parse_where_clause(where_clause):
@@ -147,9 +169,10 @@ if command == ".dbinfo":
 elif command == ".tables":
     with open(database_file_path, "rb") as database_file:
         page = database_file.read()
+        page_size = int.from_bytes(page[16:18], byteorder="big")
 
         table_names = []
-        for values in read_table_leaf_rows(page, 0):
+        for _, values in read_table_rows(page, 0, page_size):
             tbl_name = values[2]
             if not tbl_name.startswith("sqlite_"):  # hide internal bookkeeping tables
                 table_names.append(tbl_name)
@@ -176,24 +199,30 @@ elif command.upper().startswith("SELECT"):
         database_file.seek(0)
         file_contents = database_file.read()
 
-        root_page, create_sql = get_table_schema(file_contents, table_name)
+        root_page, create_sql = get_table_schema(file_contents, table_name, page_size)
         page_start = (root_page - 1) * page_size
 
         if select_clause.strip().upper() == "COUNT(*)":
-            num_cells, _ = read_page_header(file_contents, page_start)
-            print(num_cells)
+            rows = read_table_rows(file_contents, page_start, page_size)
+            print(len(rows))
         else:
             column_names = parse_column_names(create_sql)
+            int_pk_index = find_integer_primary_key_index(create_sql, column_names)
             selected_columns = [c.strip() for c in select_clause.split(",")]
             selected_indexes = [column_names.index(c) for c in selected_columns]
 
-            rows = read_table_leaf_rows(file_contents, page_start)
+            rows = read_table_rows(file_contents, page_start, page_size)
+            if int_pk_index is not None:  # INTEGER PRIMARY KEY column aliases the rowid
+                rows = [
+                    (rowid, [rowid if i == int_pk_index else v for i, v in enumerate(values)])
+                    for rowid, values in rows
+                ]
             if where_clause is not None:
                 where_column, where_value = parse_where_clause(where_clause)
                 where_column_index = column_names.index(where_column)
-                rows = [row for row in rows if str(row[where_column_index]) == where_value]
+                rows = [(rowid, values) for rowid, values in rows if str(values[where_column_index]) == where_value]
 
-            for row in rows:
-                print("|".join(str(row[i]) for i in selected_indexes))
+            for _, values in rows:
+                print("|".join(str(values[i]) for i in selected_indexes))
 else:
     print(f"Invalid command: {command}")
