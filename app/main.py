@@ -12,13 +12,12 @@ def read_varint(data, offset):
     """Parse a SQLite varint starting at offset, return (value, new_offset)."""
     value = 0
     for i in range(9):
-        byte = data[offset + i]
+        byte = data[offset]
+        offset += 1
         if i == 8:
             value = (value << 8) | byte
-            offset += 1
             break
         value = (value << 7) | (byte & 0x7F)
-        offset += 1
         if not (byte & 0x80):
             break
     return value, offset
@@ -104,6 +103,26 @@ def read_table_leaf_rows(data, page_start):
     return rows
 
 
+def get_table_schema(data, table_name):
+    """Look up a table's (rootpage, create_sql) from sqlite_schema."""
+    for values in read_table_leaf_rows(data, 0):
+        if values[2] == table_name:
+            return values[3], values[4]
+    return None, None
+
+
+def parse_column_names(create_sql):
+    """Extract column names, in order, from a CREATE TABLE statement."""
+    inner = create_sql[create_sql.index("(") + 1:create_sql.rindex(")")]
+    column_names = []
+    for part in inner.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        column_names.append(part.split()[0].strip('"[]`'))
+    return column_names
+
+
 if command == ".dbinfo":
     with open(database_file_path, "rb") as database_file:
         # You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -130,8 +149,12 @@ elif command == ".tables":
                 table_names.append(tbl_name)
 
         print(" ".join(table_names))
-elif command.upper().startswith("SELECT COUNT(*)"):
-    table_name = command.split(" ")[-1]
+elif command.upper().startswith("SELECT"):
+    parts = command.split()
+    from_index = next(i for i, part in enumerate(parts) if part.upper() == "FROM")
+    select_clause = " ".join(parts[1:from_index])
+    table_name = parts[from_index + 1]
+
     with open(database_file_path, "rb") as database_file:
         database_file.seek(16)
         page_size = int.from_bytes(database_file.read(2), byteorder="big")
@@ -139,14 +162,18 @@ elif command.upper().startswith("SELECT COUNT(*)"):
         database_file.seek(0)
         file_contents = database_file.read()
 
-        root_page = None
-        for values in read_table_leaf_rows(file_contents, 0):
-            if values[2] == table_name:
-                root_page = values[3]
-                break
-
+        root_page, create_sql = get_table_schema(file_contents, table_name)
         page_start = (root_page - 1) * page_size
-        num_cells, _ = read_page_header(file_contents, page_start)
-        print(num_cells)
+
+        if select_clause.strip().upper() == "COUNT(*)":
+            num_cells, _ = read_page_header(file_contents, page_start)
+            print(num_cells)
+        else:
+            column_names = parse_column_names(create_sql)
+            selected_columns = [c.strip() for c in select_clause.split(",")]
+            selected_indexes = [column_names.index(c) for c in selected_columns]
+
+            for row in read_table_leaf_rows(file_contents, page_start):
+                print("|".join(str(row[i]) for i in selected_indexes))
 else:
     print(f"Invalid command: {command}")
